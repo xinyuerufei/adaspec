@@ -30,9 +30,9 @@ fi
 
 nvidia-smi
 
-accelerate launch --config_file accelerate_configs/zero1.yaml train.py \
+accelerate launch --config_file accelerate_configs/zero3.yaml train.py \
     --draft_model_name_or_path $model \
-    --target_model_name_or_path "path/to/target/checkpoint-1404" \
+    --target_model_name_or_path "./checkpoints/gsm8k-target-qwen-7b/checkpoint-5610" \
     \
     --data_name gsm8k \
     \
