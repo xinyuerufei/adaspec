@@ -30,7 +30,7 @@ fi
 
 nvidia-smi
 
-accelerate launch --config_file accelerate_configs/zero1.yaml train.py \
+accelerate launch --config_file accelerate_configs/zero3.yaml train.py \
     --model_name_or_path $model \
     \
     --data_name gsm8k \
