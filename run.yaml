@@ -1,0 +1,109 @@
+description: debug
+target:
+  service: sing
+  #name: palisades03@gcr-singularity-octo
+  name: msrresrchvc@gcr-singularity-resrch
+  #name: msrresrchbasicvc@gcr-singularity
+  #name: msrresrchlab@gcr-singularity-lab 
+  workspace_name: workspace_genai
+
+environment:
+  # you can also build your own docker
+  image: amlt-sing/acpt-torch2.7.1-py3.10-cuda12.6-ubuntu22.04
+  setup:
+  - pip list
+  - pwd
+  - ls
+  - echo "finish ls"
+  - pip install transformers==4.52.3 datasets==3.6.0
+  - pip install trl accelerate deepspeed tensorboard ipdb
+  - ls /mnt/blob
+  - pip list
+  - nvidia-smi
+code:
+  # $CONFIG_DIR means the current dir of the yaml file, which is going to be submitted to the cluster.
+  # NOTE submit code files rather than data files
+  local_dir: $CONFIG_DIR
+
+storage:
+  blob:
+    storage_account_name: msranlphot
+    container_name: jiaxin
+
+search:
+  job_template:
+    name: adaspec-train
+    #name: gs-toynew-{energy_position}-{lr}-{use_normalize}
+    #sku: 40G8-A100
+    #sku: 1x64G16-MI200-xGMI
+    #sku: 1x192G8-MI300X-xGMI
+    # sku: 40G1-A100
+    #sku: 32G1-V100
+    sku: 80G4-A100
+    command:
+    # - export HF_HOME=/mnt/blob/zechi/hf-cache
+    #- export CUDA_VISIBLE_DEVICES=3 
+    #- echo "downloading satnet" 
+    #- bash data/download-satnet.sh 
+    #- echo "downloading rrn" 
+    #- bash data/download-rrn.sh
+    #- python3 train.py --dataset sudoku-rrn --batch_size 64 --model sudoku --cond_mask True --supervise-energy-landscape True --use-innerloop-opt True 
+    #- bash run.sh
+    #- export ROCBLAS_INTERNAL_FP16_ALT_IMPL=1
+    #- export RCCL_MSCCL_ENABLE=0
+    #- export PATH=/home/aiscuser/.local/bin:$$PATH
+    # - export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+    #- export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+    #- unset OMPI_COMM_WORLD_LOCAL_RANK
+    #- echo "HF_HOME=$${HF_HOME}"
+    #- echo "PATH=$${PATH}"
+    #- python toy.py #--energy_position {energy_position} --lr {lr} --use_normalize {use_normalize}
+    #- torchrun --nproc_per_node=16 gs.py --energy_position {energy_position} --have_preprompt {have_preprompt} --weight_decay {weight_decay} --epochs {epochs}
+    #- cd scripts
+    - export CUDA_VISIBLE_DEVICES=0,1,2,3
+    - export PATH=$$HOME/.local/bin:$$PATH
+    - bash run.sh
+    #- cd train/scripts
+    #- bash run.sh
+    - echo "lr=$${lr}"
+    - sleep infinity
+    #- cd Dream-SFT
+    #- export CUDA_VISIBLE_DEVICES=0,1
+    #- python sft_train.py
+    #- sleep infinity
+    #- python run_generative.py --model "/mnt/blob/deepverify-autosync_az/RM-14b-4k-16n-1e-6-combo3-roll16-p21-ent3-t08/global_step_340/actor/huggingface" --model_modifier "Skywork" --dataset {dataset} --max_response_tokens 8192 --temperature 0.6 --run_name "14b_rl_comb3_roll16p21ent3t08_step680_{dataset}" --num_gpus 4
+    #- echo "HF_HOME=$${HF_HOME}"
+    #- echo "PATH=$${PATH}"
+    #- torchrun --nproc_per_node=4 src/xnlp/run/train_pebm.py --output_dir /mnt/blob/zechi/proj/ebm-reason/pebm-exp/{exp_name}-lr{lr}-bsz{bsz} --max_steps 50000 --save_strategy steps --logging_steps 20 --learning_rate={lr} --save_only_model True --save_steps 5000 --save_safetensors False --per_device_train_batch_size {bsz} --warmup_steps 500 --dataloader_num_workers 2 --enc_dec_model /mnt/blob/zechi/proj/ebm-reason/vae-model-v0 --use_v2_model True
+
+    submit_args:
+      env:
+        NCCL_DEBUG: DEBUG
+        max_run_duration_seconds: 1000000
+        MKL_NUM_THREADS: 1
+        OMP_NUM_THREADS: 1
+        #WANDB_API_KEY: 76781e9464db4b9f798e8e671aba26021f976f0c
+        #WANDB_PROJECT: adaspec-train
+
+    priority: High
+    mpi: False
+    process_count_per_node: 1
+    # execution_mode: basic
+    # priority: High
+    #sla_tier: Basic
+    #sla_tier: Standard
+    sla_tier: Premium
+    identity: managed
+  
+  type: grid
+  max_trials: 500
+  params:
+    #- name: energy_position
+      #spec: discrete
+      #values: ["be", "e", "0", "be-allmean", "be-hmean", "all", "normalize_after"]
+    - name: lr
+      spec: discrete
+      values: ["2e-5"] #, "1e-4", "2e-4", "5e-4"]
+    #- name: use_normalize
+      #spec: discrete
+      #values: ["True", "False"]

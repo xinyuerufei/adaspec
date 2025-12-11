@@ -1,0 +1,30 @@
+# 模型检查点（非常大）
+checkpoints/
+
+# 日志文件
+logs/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# Azure ML 工具目录
+amlt/
+
+# Git
+.git/
+
+# 临时文件
+*.tmp
+*.swp
+*.bak
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 数据集缓存（如果有）
+data/
+datasets/
+.cache/
+

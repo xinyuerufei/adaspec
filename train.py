@@ -9,6 +9,7 @@ from transformers import (
 from utils import *
 
 
+
 @dataclass
 class ModelArguments:
     draft_model_name_or_path: Optional[str] = field(default="Qwen/Qwen1.5-4B")
@@ -16,6 +17,30 @@ class ModelArguments:
     model_max_length: int = field(
         default=512,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
+    )
+    use_on_policy: bool = field(
+        default=True,
+        metadata={"help": "Whether to use on-policy distillation. True for on-policy, False for off-policy."},
+    )
+    kl_type: str = field(
+        default="forward",
+        metadata={"help": "KL divergence type: 'forward' (KL(P||Q)) or 'reverse' (KL(Q||P))"},
+    )
+    max_new_tokens: int = field(
+        default=512,
+        metadata={"help": "Maximum number of new tokens to generate in on-policy sampling."},
+    )
+    temperature: float = field(
+        default=1.0,
+        metadata={"help": "Sampling temperature for on-policy generation."},
+    )
+    top_k: int = field(
+        default=0,
+        metadata={"help": "Top-k sampling parameter (0 to disable)."},
+    )
+    top_p: float = field(
+        default=0.0,
+        metadata={"help": "Top-p (nucleus) sampling parameter (0.0 to disable)."},
     )
 
 
@@ -70,8 +95,19 @@ def train():
     ########################
     data_module = make_supervised_data_module(tokenizer=draft_tokenizer, data_name="gsm8k")
 
-    trainer = CustomTrainer(model=draft_model, tokenizer=draft_tokenizer, args=training_args, **data_module,
-                            target_model=target_model)
+    trainer = CustomTrainer(
+        model=draft_model, 
+        processing_class=draft_tokenizer, 
+        args=training_args, 
+        **data_module,
+        target_model=target_model,
+        use_on_policy=model_args.use_on_policy,
+        kl_type=model_args.kl_type,
+        max_new_tokens=model_args.max_new_tokens,
+        temperature=model_args.temperature,
+        top_k=model_args.top_k,
+        top_p=model_args.top_p,
+    )
 
     trainer.train()
 
