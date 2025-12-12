@@ -32,7 +32,7 @@ nvidia-smi
 
 accelerate launch --config_file accelerate_configs/zero1.yaml train.py \
     --draft_model_name_or_path $model \
-    --target_model_name_or_path "/mnt/jxblob/onpolicy-spec-ckpt/checkpoints/gsm8k-target-qwen-7b/checkpoint-5610" \
+    --target_model_name_or_path "/mnt/blob/onpolicy-spec-ckpt/checkpoints/gsm8k-target-qwen-7b/checkpoint-5610" \
     \
     --data_name gsm8k \
     \
@@ -44,7 +44,7 @@ accelerate launch --config_file accelerate_configs/zero1.yaml train.py \
     --top_p 0.0 \
     \
     --bf16 True \
-    --output_dir "/mnt/jxblob/onpolicy-spec-ckpt/checkpoints/$version" \
+    --output_dir "/mnt/blob/onpolicy-spec-ckpt/checkpoints/$version" \
     --num_train_epochs 3 \
     --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 1 \
