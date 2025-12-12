@@ -417,17 +417,7 @@ class CustomTrainer(Trainer):
                     index=generated_tokens.unsqueeze(-1)
                 ).squeeze(-1)  # [batch, num_new_tokens]
             
-            # 4. 计算 reverse KL（类似伪代码: reverse_kl = sampled_logprobs - teacher_logprobs）
-            # sampled_logprobs: 学生采样时的 log prob
-            # teacher_logprobs: 教师对相同 token 的 log prob
-            reverse_kl = sampled_logprobs - teacher_logprobs  # [batch, num_new_tokens]
-            
-            # advantages = -reverse_kl（类似伪代码: trajectories["advantages"] = -reverse_kl）
-            # 当学生给某个 token 的概率比教师高时，reverse_kl > 0，advantage < 0
-            # 这会降低该 token 的概率，使学生更接近教师
-            advantages = -reverse_kl  # [batch, num_new_tokens]
-            
-            # 5. 重新计算学生模型的 log prob（需要梯度，用于 policy gradient）
+            # 4. 重新计算学生模型的 log prob（需要梯度）
             student_outputs = model(
                 input_ids=generated_ids, 
                 attention_mask=generated_attention_mask, 
@@ -436,6 +426,9 @@ class CustomTrainer(Trainer):
             student_logits = student_outputs.logits.float()
             
             # 获取生成部分的 logits
+            # generated_ids 结构: [left_pad prompt new_tokens]
+            # logits[i] 预测 token[i+1]
+            # 所以预测 new_tokens 的 logits 位置是 [-(num_new_tokens+1):-1]
             student_logits_gen = student_logits[:, -(num_new_tokens+1):-1, :]  # [batch, num_new_tokens, vocab]
             student_log_probs = F.log_softmax(student_logits_gen, dim=-1)
             
@@ -445,44 +438,35 @@ class CustomTrainer(Trainer):
                 index=generated_tokens.unsqueeze(-1)
             ).squeeze(-1)  # [batch, num_new_tokens]
             
-            # 6. 计算 Policy Gradient Loss（类似伪代码的 importance_sampling loss）
+            # 5. 计算 KL Loss（直接可微，不需要 REINFORCE）
             # 创建 mask 来忽略 padding 部分
             token_mask = (generated_tokens != self.processing_class.pad_token_id).float()
             num_valid_tokens = token_mask.sum().clamp(min=1)
             
             if self.kl_type == "reverse":
-                # 目标：最小化 Reverse KL = E_Q[log Q - log P]
-                # Policy Gradient: ∇ KL = E_Q[(log Q - log P) * ∇ log Q]
+                # Reverse KL: KL(Q||P) = E_Q[log Q - log P]
+                # loss = (new_logprobs - teacher_logprobs) 的均值
+                # new_logprobs 有梯度，teacher_logprobs 没有梯度
                 # 
-                # reverse_kl = log Q - log P（应该 ≥ 0，因为 KL divergence 非负）
-                # 但由于采样噪声，单个 token 的值可能为负
-                
-                # 计算 policy gradient loss
-                # loss = (reverse_kl.detach() * new_logprobs * mask).mean()
-                pg_loss = (reverse_kl.detach() * new_logprobs * token_mask).sum() / num_valid_tokens
-                
-                # 计算真正的 KL 值用于监控（应该是正数）
-                kl_value = (reverse_kl * token_mask).sum() / num_valid_tokens
-                
-                # 技巧：让 loss 显示为 KL 值（正数），但梯度来自 pg_loss
-                # loss = pg_loss - pg_loss.detach() + kl_value.detach()
-                # 这样 loss.item() = kl_value，但 ∇loss = ∇pg_loss
-                loss = pg_loss - pg_loss.detach() + kl_value.detach()
+                # 这和伪代码一致：
+                # reverse_kl = sampled_logprobs - teacher_logprobs
+                # 但我们用 new_logprobs（重新计算的，有梯度）代替 sampled_logprobs
+                reverse_kl = new_logprobs - teacher_logprobs  # [batch, num_new_tokens]
+                loss = (reverse_kl * token_mask).sum() / num_valid_tokens
                 
             elif self.kl_type == "forward":
-                # Forward KL 需要用教师分布采样，这里用 importance sampling 近似
+                # Forward KL: KL(P||Q) = E_P[log P - log Q]
+                # 由于我们从 Q 采样，用 importance sampling:
+                # KL(P||Q) ≈ E_Q[(P/Q) * (log P - log Q)]
                 with torch.no_grad():
-                    importance_weights = (teacher_logprobs - sampled_logprobs).exp()  # P(a)/Q(a)
+                    # importance weight = P(a)/Q(a) = exp(log P - log Q)
+                    importance_weights = (teacher_logprobs - sampled_logprobs).exp()
                     importance_weights = importance_weights.clamp(max=10.0)  # 防止权重过大
                 
-                # Forward KL ≈ E_Q[w * (log P - log Q)]
-                log_ratio = teacher_logprobs.detach() - new_logprobs  # log(P/Q)
-                pg_loss = (importance_weights * log_ratio * token_mask).sum() / num_valid_tokens
-                
-                # 计算 KL 值用于监控
-                kl_value = (importance_weights * (teacher_logprobs - sampled_logprobs) * token_mask).sum() / num_valid_tokens
-                
-                loss = pg_loss - pg_loss.detach() + kl_value.detach()
+                # loss = E_Q[w * (log P - log Q)] = E_Q[w * (-log Q + log P)]
+                # 只有 -log Q 部分有梯度
+                forward_kl = importance_weights * (teacher_logprobs - new_logprobs)
+                loss = (forward_kl * token_mask).sum() / num_valid_tokens
             else:
                 raise ValueError(f"Unknown KL type: {self.kl_type}. Must be 'forward' or 'reverse'")
             
