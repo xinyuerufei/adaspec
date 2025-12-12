@@ -184,7 +184,7 @@ class CustomTrainer(Trainer):
     def _sample_from_model(self, model, input_ids, attention_mask, max_new_tokens):
         """使用模型进行自回归采样生成序列（on-policy 采样）
         
-        使用 HuggingFace 的 model.generate() 方法，更稳定可靠
+        返回生成的序列、attention mask、以及采样时的 log probabilities
         """
         was_training = model.training
         model.eval()  # 采样时使用 eval 模式以确保稳定性
@@ -195,13 +195,6 @@ class CustomTrainer(Trainer):
         pad_token_id = self.processing_class.pad_token_id
         if pad_token_id is None:
             pad_token_id = self.processing_class.eos_token_id
-        
-        # 构建 bad_words_ids 列表，阻止生成 "Human" 等对话标记
-        bad_words_ids = []
-        for bad_word in ["Human", "Human:", "Assistant", "Assistant:"]:
-            encoded = self.processing_class.encode(bad_word, add_special_tokens=False)
-            if encoded:
-                bad_words_ids.append(encoded)
         
         # ====== 将右 padding 转换为左 padding（生成时推荐）======
         # 计算每个序列的实际长度
@@ -228,36 +221,96 @@ class CustomTrainer(Trainer):
             # 如果 prompt 已经达到最大长度，直接返回
             if was_training:
                 model.train()
-            return input_ids, attention_mask
+            # 返回空的 logprobs
+            empty_logprobs = torch.zeros((batch_size, 0), device=input_ids.device)
+            return input_ids, attention_mask, empty_logprobs, 0
+        
+        # ====== 自回归采样并记录 log probabilities ======
+        generated_tokens = []
+        sampled_logprobs = []
+        
+        current_ids = left_padded_input_ids.clone()
+        current_mask = left_padded_attention_mask.clone()
+        
+        # 记录每个样本是否已经结束生成
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
         
         with torch.no_grad():
-            # 禁用混合精度，使用 fp32 进行采样以避免数值溢出（低 temperature 会放大 logits）
-            with torch.cuda.amp.autocast(enabled=False):
-                # 使用 model.generate() 进行采样（使用左 padding 的输入）
-                generated_ids = model.generate(
-                    input_ids=left_padded_input_ids,
-                    attention_mask=left_padded_attention_mask,
-                    max_new_tokens=effective_max_new_tokens,
-                    temperature=self.temperature if self.temperature > 0 else 1.0,
-                    top_k=self.top_k if self.top_k > 0 else 50,
-                    top_p=self.top_p if self.top_p > 0 else 1.0,
-                    do_sample=True,
-                    pad_token_id=pad_token_id,
-                    eos_token_id=self.processing_class.eos_token_id,
-                    bad_words_ids=bad_words_ids if bad_words_ids else None,  # 阻止生成这些词
-                    use_cache=True,  # 使用 KV cache 加速生成
-                )
+            for step in range(effective_max_new_tokens):
+                # Forward pass
+                outputs = model(input_ids=current_ids, attention_mask=current_mask, use_cache=False)
+                logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+                
+                # 用原始 logits 计算 log probabilities（不带 temperature）
+                # 这样和后面计算 teacher_logprobs、new_logprobs 保持一致
+                log_probs = F.log_softmax(logits.float(), dim=-1)
+                
+                # 应用 temperature 进行采样（只影响采样，不影响 log prob 计算）
+                if self.temperature > 0 and self.temperature != 1.0:
+                    sampling_logits = logits / self.temperature
+                else:
+                    sampling_logits = logits
+                
+                # 采样
+                probs = F.softmax(sampling_logits.float(), dim=-1)
+                
+                # Top-k filtering
+                if self.top_k > 0:
+                    top_k = min(self.top_k, probs.shape[-1])
+                    top_k_probs, top_k_indices = torch.topk(probs, top_k, dim=-1)
+                    # 重新归一化
+                    top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+                    # 从 top-k 中采样
+                    sampled_indices = torch.multinomial(top_k_probs, num_samples=1)  # [batch_size, 1]
+                    next_tokens = torch.gather(top_k_indices, dim=-1, index=sampled_indices).squeeze(-1)  # [batch_size]
+                else:
+                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(-1)  # [batch_size]
+                
+                # 获取采样 token 的 log probability（用原始 logits 的 log prob）
+                token_logprobs = log_probs.gather(dim=-1, index=next_tokens.unsqueeze(-1)).squeeze(-1)  # [batch_size]
+                
+                # 对已经结束的样本，设置 logprob 为 0
+                token_logprobs = token_logprobs.masked_fill(finished, 0.0)
+                
+                # 更新结束状态
+                finished = finished | (next_tokens == self.processing_class.eos_token_id)
+                
+                # 对已经结束的样本，用 pad_token 填充
+                next_tokens = next_tokens.masked_fill(finished, pad_token_id)
+                
+                generated_tokens.append(next_tokens)
+                sampled_logprobs.append(token_logprobs)
+                
+                # 更新 current_ids 和 current_mask
+                current_ids = torch.cat([current_ids, next_tokens.unsqueeze(-1)], dim=-1)
+                current_mask = torch.cat([current_mask, (~finished).long().unsqueeze(-1)], dim=-1)
+                
+                # 如果所有样本都结束了，提前退出
+                if finished.all():
+                    break
+        
+        # 拼接生成的 tokens 和 logprobs
+        if generated_tokens:
+            generated_tokens = torch.stack(generated_tokens, dim=1)  # [batch_size, num_new_tokens]
+            sampled_logprobs = torch.stack(sampled_logprobs, dim=1)  # [batch_size, num_new_tokens]
+            num_new_tokens = generated_tokens.shape[1]
+            
+            # 拼接到原始序列
+            generated_ids = torch.cat([left_padded_input_ids, generated_tokens], dim=-1)
+        else:
+            generated_ids = left_padded_input_ids
+            sampled_logprobs = torch.zeros((batch_size, 0), device=input_ids.device)
+            num_new_tokens = 0
         
         # 生成对应的 attention mask
         generated_attention_mask = torch.ones_like(generated_ids, dtype=attention_mask.dtype)
-        # 对于 padding 部分设为 0（左边的 padding）
         generated_attention_mask[generated_ids == pad_token_id] = 0
         
         # 恢复模型原来的训练状态
         if was_training:
             model.train()
         
-        return generated_ids, generated_attention_mask
+        return generated_ids, generated_attention_mask, sampled_logprobs, num_new_tokens
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         # 在评估模式下，使用 off-policy 方式（不进行采样生成）
@@ -265,7 +318,13 @@ class CustomTrainer(Trainer):
         is_training = model.training
         
         if self.use_on_policy and is_training:
-            # ========== On-Policy Distillation ==========
+            # ========== On-Policy RL-style Distillation ==========
+            # 类似伪代码的流程:
+            # 1. 用学生模型采样轨迹，记录 sampled_logprobs
+            # 2. 用教师模型计算 teacher_logprobs
+            # 3. 计算 reverse_kl = sampled_logprobs - teacher_logprobs
+            # 4. 使用 policy gradient loss: -advantage * new_logprobs
+            
             # 1. 提取 prompt（source 部分）
             labels = inputs.get("labels", None)
             input_ids = inputs["input_ids"]
@@ -273,29 +332,22 @@ class CustomTrainer(Trainer):
             
             # 找到 prompt 的结束位置（labels 中 IGNORE_INDEX 的部分是 prompt）
             if labels is not None:
-                # labels 中 IGNORE_INDEX 的位置是 prompt 部分
-                # 找到每个样本中最后一个 IGNORE_INDEX 的位置（prompt 的结束位置）
-                prompt_mask = labels == IGNORE_INDEX
-                # 计算每个样本的 prompt 长度（最后一个 IGNORE_INDEX 的位置 + 1）
                 prompt_lengths = []
                 for i in range(labels.shape[0]):
-                    # 找到最后一个 IGNORE_INDEX 的位置
                     ignore_positions = (labels[i] == IGNORE_INDEX).nonzero(as_tuple=True)[0]
                     if len(ignore_positions) > 0:
                         prompt_len = ignore_positions[-1].item() + 1
                     else:
-                        # 如果没有 IGNORE_INDEX，使用整个序列
                         prompt_len = labels.shape[1]
                     prompt_lengths.append(prompt_len)
                 prompt_lengths = torch.tensor(prompt_lengths, device=input_ids.device)
             else:
-                # 如果没有 labels，假设整个输入都是 prompt
                 if attention_mask is not None:
                     prompt_lengths = attention_mask.sum(dim=1)
                 else:
                     prompt_lengths = torch.full((input_ids.shape[0],), input_ids.shape[1], device=input_ids.device)
             
-            # 提取 prompt（每个样本的前 prompt_len 个 tokens）
+            # 提取 prompt
             batch_size = input_ids.shape[0]
             max_prompt_len = prompt_lengths.max().item()
             prompt_ids = input_ids[:, :max_prompt_len].clone()
@@ -304,26 +356,18 @@ class CustomTrainer(Trainer):
             else:
                 prompt_attention_mask = torch.ones((batch_size, max_prompt_len), device=input_ids.device, dtype=torch.long)
             
-            # 对于长度不足的样本，用 pad_token 填充
             for i in range(batch_size):
                 prompt_len = prompt_lengths[i].item()
                 if prompt_len < max_prompt_len:
                     prompt_ids[i, prompt_len:] = self.processing_class.pad_token_id
                     prompt_attention_mask[i, prompt_len:] = 0
             
-            # 2. 使用 draft 模型（学生）进行自回归采样生成序列
-            # 限制 max_new_tokens 以确保不超过模型最大长度
+            # 2. 使用学生模型进行自回归采样，并记录采样时的 log probabilities
             prompt_len = prompt_ids.shape[1]
             max_length = getattr(self.processing_class, 'model_max_length', 2048)
             effective_max_new_tokens = min(self.max_new_tokens, max_length - prompt_len)
             
             if effective_max_new_tokens <= 0:
-                # 如果 prompt 已经达到最大长度，使用 off-policy 方式
-                labels = inputs.get("labels", None)
-                if labels is not None:
-                    inputs["labels"] = labels
-                else:
-                    inputs["labels"] = None
                 # 回退到 off-policy
                 outputs = model(**inputs)
                 with torch.no_grad():
@@ -334,105 +378,117 @@ class CustomTrainer(Trainer):
                 shift_target_logits = target_logits[..., :-1, :].contiguous()
                 shift_logits = shift_logits.view(-1, shift_logits.shape[-1])
                 shift_target_logits = shift_target_logits.view(-1, shift_target_logits.shape[-1])
-                shift_logits = shift_logits.float()
-                shift_target_logits = shift_target_logits.float()
-                p = F.softmax(shift_target_logits, dim=-1)
-                q_log = F.log_softmax(shift_logits, dim=-1)
-                loss_fct = nn.KLDivLoss(reduction='batchmean')
-                loss = loss_fct(q_log, p)
+                p = F.softmax(shift_target_logits.float(), dim=-1)
+                q_log = F.log_softmax(shift_logits.float(), dim=-1)
+                loss = nn.KLDivLoss(reduction='batchmean')(q_log, p)
                 return (loss, outputs) if return_outputs else loss
             
-            generated_ids, generated_attention_mask = self._sample_from_model(
+            # 采样并获取 sampled_logprobs（类似伪代码中的 trajectories.loss_fn_inputs["logprobs"]）
+            generated_ids, generated_attention_mask, sampled_logprobs, num_new_tokens = self._sample_from_model(
                 model, prompt_ids, prompt_attention_mask, effective_max_new_tokens
             )
-            # decode the generated ids
-            generated_ids_decoded = self.processing_class.batch_decode(generated_ids, skip_special_tokens=True)
             
-            # 3. 使用 target 模型（教师）对生成的序列进行评分
-            # 注意：generated_ids 是左 padding 的：[PAD PAD prompt new_tokens]
-            # prompt_ids 是右 padding 的：[prompt PAD PAD]
-            # 
-            # 简化处理：直接对完整的 generated_ids 做 forward
-            # 这样避免了左/右 padding 对齐的复杂性
-            ids_for_logits = generated_ids
-            mask_for_logits = generated_attention_mask
-            
-            # 计算 prompt 的实际长度（不含 padding）
-            actual_prompt_len = prompt_attention_mask.sum(dim=1).max().item()
-            # 新生成的 token 数量 = 总长度 - 原 padded 长度
-            padded_prompt_len = prompt_ids.shape[1]
-            new_tokens_len = generated_ids.shape[1] - padded_prompt_len
-            
-            
-            # 在左 padding 序列中，有效内容的起始位置
-            # generated_ids 结构: [PAD...PAD prompt new_tokens]
-            # 有效内容从 (total_len - actual_prompt_len - new_tokens_len) 开始
-            total_len = generated_ids.shape[1]
-            content_start = total_len - actual_prompt_len - new_tokens_len
-            
-            # 为了计算 KL，我们只关心 prompt 最后部分 + 新生成的 tokens 对应的 logits
-            context_len = min(32, actual_prompt_len)  # 只保留最后 32 个 tokens 作为上下文
-            
-            # 学生模型需要计算梯度，教师模型不需要
-            student_outputs = model(input_ids=ids_for_logits, attention_mask=mask_for_logits, use_cache=False)
-            student_logits = student_outputs.logits
-            
-            with torch.no_grad():
-                teacher_outputs = self.target_model(input_ids=ids_for_logits, attention_mask=mask_for_logits, use_cache=False)
-                teacher_logits = teacher_outputs.logits
-            
-            # 4. 计算 KL 散度
-            # 序列结构（左 padding）: [PAD...PAD prompt new_tokens]
-            # logits[i] 预测的是 token[i+1]
-            # 我们只对 new_tokens 部分计算 KL loss
-            # 
-            # 预测 new_tokens 的 logits 位置:
-            #   - 第一个 new_token 由位置 (content_start + actual_prompt_len - 1) 的 logits 预测
-            #   - 最后一个 new_token 由位置 (total_len - 2) 的 logits 预测
-            gen_logits_start = content_start + actual_prompt_len - 1
-            gen_logits_end = total_len - 1  # 不包含最后一个位置（因为它预测的是 EOS 之后）
-            
-            
-            # 确保有有效的 logits 来计算
-            if gen_logits_end <= gen_logits_start:
-                # 没有生成新 tokens，跳过这个 batch 或返回 0 loss
+            if num_new_tokens == 0:
                 print("[Debug] No new tokens generated, returning zero loss", flush=True)
-                loss = torch.tensor(0.0, device=student_logits.device, requires_grad=True)
-                return (loss, student_outputs) if return_outputs else loss
+                loss = torch.tensor(0.0, device=input_ids.device, requires_grad=True)
+                outputs = model(**inputs)
+                return (loss, outputs) if return_outputs else loss
             
-            student_logits_gen = student_logits[:, gen_logits_start:gen_logits_end, :].contiguous()
-            teacher_logits_gen = teacher_logits[:, gen_logits_start:gen_logits_end, :].contiguous()
+            # 3. 计算教师模型的 log probabilities（类似伪代码中的 teacher_client.compute_logprobs）
+            with torch.no_grad():
+                teacher_outputs = self.target_model(
+                    input_ids=generated_ids, 
+                    attention_mask=generated_attention_mask, 
+                    use_cache=False
+                )
+                teacher_logits = teacher_outputs.logits.float()
+                
+                # 获取生成部分的 logits
+                # generated_ids 结构: [left_pad prompt new_tokens]
+                # logits[i] 预测 token[i+1]
+                # 所以预测 new_tokens 的 logits 位置是 [-(num_new_tokens+1):-1]
+                teacher_logits_gen = teacher_logits[:, -(num_new_tokens+1):-1, :]  # [batch, num_new_tokens, vocab]
+                teacher_log_probs = F.log_softmax(teacher_logits_gen, dim=-1)
+                
+                # 获取采样 token 对应的 log prob
+                generated_tokens = generated_ids[:, -num_new_tokens:]  # [batch, num_new_tokens]
+                teacher_logprobs = teacher_log_probs.gather(
+                    dim=-1, 
+                    index=generated_tokens.unsqueeze(-1)
+                ).squeeze(-1)  # [batch, num_new_tokens]
             
-            # 展平
-            student_logits_flat = student_logits_gen.view(-1, student_logits_gen.shape[-1])
-            teacher_logits_flat = teacher_logits_gen.view(-1, teacher_logits_gen.shape[-1])
+            # 4. 计算 reverse KL（类似伪代码: reverse_kl = sampled_logprobs - teacher_logprobs）
+            # sampled_logprobs: 学生采样时的 log prob
+            # teacher_logprobs: 教师对相同 token 的 log prob
+            reverse_kl = sampled_logprobs - teacher_logprobs  # [batch, num_new_tokens]
             
-            # 转换为 float
-            student_logits_flat = student_logits_flat.float()
-            teacher_logits_flat = teacher_logits_flat.float()
+            # advantages = -reverse_kl（类似伪代码: trajectories["advantages"] = -reverse_kl）
+            # 当学生给某个 token 的概率比教师高时，reverse_kl > 0，advantage < 0
+            # 这会降低该 token 的概率，使学生更接近教师
+            advantages = -reverse_kl  # [batch, num_new_tokens]
             
-            # 计算 KL 散度
-            if self.kl_type == "forward":
-                # Forward KL: KL(P||Q) = sum(P * log(P/Q))
-                # 使用 KLDivLoss(q_log, p)，其中 q_log = log(Q), p = P
-                p = F.softmax(teacher_logits_flat, dim=-1)  # P (teacher)
-                q_log = F.log_softmax(student_logits_flat, dim=-1)  # log(Q) (student)
-                loss_fct = nn.KLDivLoss(reduction='batchmean')
-                loss = loss_fct(q_log, p)
-            elif self.kl_type == "reverse":
-                # Reverse KL: KL(Q||P) = sum(Q * log(Q/P))
-                # 使用 KLDivLoss(p_log, q)，其中 p_log = log(P), q = Q
-                q = F.softmax(student_logits_flat, dim=-1)  # Q (student)
-                p_log = F.log_softmax(teacher_logits_flat, dim=-1)  # log(P) (teacher)
-                loss_fct = nn.KLDivLoss(reduction='batchmean')
-                loss = loss_fct(p_log, q)
+            # 5. 重新计算学生模型的 log prob（需要梯度，用于 policy gradient）
+            student_outputs = model(
+                input_ids=generated_ids, 
+                attention_mask=generated_attention_mask, 
+                use_cache=False
+            )
+            student_logits = student_outputs.logits.float()
+            
+            # 获取生成部分的 logits
+            student_logits_gen = student_logits[:, -(num_new_tokens+1):-1, :]  # [batch, num_new_tokens, vocab]
+            student_log_probs = F.log_softmax(student_logits_gen, dim=-1)
+            
+            # 获取采样 token 对应的 log prob（带梯度）
+            new_logprobs = student_log_probs.gather(
+                dim=-1, 
+                index=generated_tokens.unsqueeze(-1)
+            ).squeeze(-1)  # [batch, num_new_tokens]
+            
+            # 6. 计算 Policy Gradient Loss（类似伪代码的 importance_sampling loss）
+            # 创建 mask 来忽略 padding 部分
+            token_mask = (generated_tokens != self.processing_class.pad_token_id).float()
+            num_valid_tokens = token_mask.sum().clamp(min=1)
+            
+            if self.kl_type == "reverse":
+                # 目标：最小化 Reverse KL = E_Q[log Q - log P]
+                # Policy Gradient: ∇ KL = E_Q[(log Q - log P) * ∇ log Q]
+                # 
+                # reverse_kl = log Q - log P（应该 ≥ 0，因为 KL divergence 非负）
+                # 但由于采样噪声，单个 token 的值可能为负
+                
+                # 计算 policy gradient loss
+                # loss = (reverse_kl.detach() * new_logprobs * mask).mean()
+                pg_loss = (reverse_kl.detach() * new_logprobs * token_mask).sum() / num_valid_tokens
+                
+                # 计算真正的 KL 值用于监控（应该是正数）
+                kl_value = (reverse_kl * token_mask).sum() / num_valid_tokens
+                
+                # 技巧：让 loss 显示为 KL 值（正数），但梯度来自 pg_loss
+                # loss = pg_loss - pg_loss.detach() + kl_value.detach()
+                # 这样 loss.item() = kl_value，但 ∇loss = ∇pg_loss
+                loss = pg_loss - pg_loss.detach() + kl_value.detach()
+                
+            elif self.kl_type == "forward":
+                # Forward KL 需要用教师分布采样，这里用 importance sampling 近似
+                with torch.no_grad():
+                    importance_weights = (teacher_logprobs - sampled_logprobs).exp()  # P(a)/Q(a)
+                    importance_weights = importance_weights.clamp(max=10.0)  # 防止权重过大
+                
+                # Forward KL ≈ E_Q[w * (log P - log Q)]
+                log_ratio = teacher_logprobs.detach() - new_logprobs  # log(P/Q)
+                pg_loss = (importance_weights * log_ratio * token_mask).sum() / num_valid_tokens
+                
+                # 计算 KL 值用于监控
+                kl_value = (importance_weights * (teacher_logprobs - sampled_logprobs) * token_mask).sum() / num_valid_tokens
+                
+                loss = pg_loss - pg_loss.detach() + kl_value.detach()
             else:
                 raise ValueError(f"Unknown KL type: {self.kl_type}. Must be 'forward' or 'reverse'")
             
-            # 使用 student_outputs 作为 outputs（它已经是正确的格式）
             outputs = student_outputs
             
-            # 应用后处理（与 off-policy 分支保持一致）
+            # 应用后处理
             if (
                     self.args.average_tokens_across_devices
                     and (self.model_accepts_loss_kwargs or self.compute_loss_func)
@@ -440,20 +496,7 @@ class CustomTrainer(Trainer):
             ):
                 loss *= self.accelerator.num_processes
             
-            # 注册 hook 来监控 loss 的梯度计算
-            if not self._loss_hook_registered:
-                def loss_backward_hook(grad):
-                    return grad
-                
-                if loss.requires_grad:
-                    loss.register_hook(loss_backward_hook)
-                    self._loss_hook_registered = True
-            
-            # 检查是否需要返回 outputs
-            if return_outputs:
-                return (loss, outputs)
-            else:
-                return loss
+            return (loss, outputs) if return_outputs else loss
             
         else:
             # 评估模式或 off-policy 模式：使用标准的 forward pass

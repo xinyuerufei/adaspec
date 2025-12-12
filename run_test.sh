@@ -22,9 +22,9 @@ else
     echo "./logs/$version folder already exists"
 fi
 
-python test.py \
-    --target_model_name_or_path "./checkpoints/gsm8k-target-qwen-7b/checkpoint-5610" \
+python test_alpha.py \
+    --target_model_name_or_path "/mnt/jxblob/onpolicy-spec-ckpt/checkpoints/gsm8k-target-qwen-7b/checkpoint-5610" \
     --data_name gsm8k \
-    --output_dir "./checkpoints/gsm8k-target-qwen-7b-ref-qwen-0.5b-3epoch" \
+    --output_dir "/mnt/jxblob/onpolicy-spec-ckpt/checkpoints/gsm8k-target-qwen-7b-ref-qwen-0.5b-onpolicy-3epoch" \
     --batch_size 1 \
     2>&1 | tee -a "./logs/gsm8k-target-qwen-7b-ref-qwen-0.5b-3epoch/log.txt"
