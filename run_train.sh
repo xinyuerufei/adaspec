@@ -30,14 +30,14 @@ fi
 
 nvidia-smi
 
-accelerate launch --config_file accelerate_configs/zero3.yaml train.py \
+accelerate launch --config_file accelerate_configs/zero1.yaml train.py \
     --draft_model_name_or_path $model \
-    --target_model_name_or_path "./checkpoints/gsm8k-target-qwen-7b/checkpoint-5610" \
+    --target_model_name_or_path "/mnt/jxblob/onpolicy-spec-ckpt/checkpoints/gsm8k-target-qwen-7b/checkpoint-5610" \
     \
     --data_name gsm8k \
     \
     --bf16 True \
-    --output_dir "./checkpoints/$version" \
+    --output_dir "/mnt/jxblob/onpolicy-spec-ckpt/checkpoints/$version" \
     --num_train_epochs 3 \
     --per_device_train_batch_size 2 \
     --gradient_accumulation_steps 1 \
@@ -49,10 +49,12 @@ accelerate launch --config_file accelerate_configs/zero3.yaml train.py \
     --prediction_loss_only True \
     --eval_on_start \
     --save_only_model True \
-    --learning_rate 3e-4 \
+    --learning_rate 1e-5 \
     --weight_decay 0.1 \
-    --lr_scheduler_type "constant" \
+    --lr_scheduler_type "cosine" \
+    --warmup_ratio 0.1 \
+    --max_grad_norm 1.0 \
     --logging_steps 10 \
     --report_to tensorboard \
     --logging_dir "./logs/$version" \
-    --gradient_checkpointing True
+    --gradient_checkpointing False
