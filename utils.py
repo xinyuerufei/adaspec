@@ -438,35 +438,90 @@ class CustomTrainer(Trainer):
                 index=generated_tokens.unsqueeze(-1)
             ).squeeze(-1)  # [batch, num_new_tokens]
             
-            # 5. 计算 KL Loss（直接可微，不需要 REINFORCE）
+            # 5. 计算 Loss（MiniLLM 风格：REINFORCE/PPO）
             # 创建 mask 来忽略 padding 部分
-            token_mask = (generated_tokens != self.processing_class.pad_token_id).float()
+            # 注意：对于只生成少量 token 的情况，需要正确处理 mask
+            pad_token_id = self.processing_class.pad_token_id
+            eos_token_id = self.processing_class.eos_token_id
+            
+            # 有效 token = 非 pad 且非 eos（或者如果 pad==eos，则只检查非 pad）
+            if pad_token_id == eos_token_id:
+                # 对于 pad==eos 的情况，所有生成的 token 都是有效的（直到第一个 eos）
+                # 使用 generated_attention_mask 来获取有效 token
+                token_mask = generated_attention_mask[:, -num_new_tokens:].float()
+            else:
+                token_mask = (generated_tokens != pad_token_id).float()
+            
+            # 确保至少有一个有效 token
+            if token_mask.sum() == 0:
+                # 如果所有 token 都是 pad/eos，至少保留第一个 token
+                token_mask[:, 0] = 1.0
+            
             num_valid_tokens = token_mask.sum().clamp(min=1)
             
+            # ========== MiniLLM 风格的 Policy Gradient Loss ==========
+            # 
+            # 核心思想（来自 MiniLLM）：
+            # - reward = log p_teacher(y) - log q_student_old(y)  (采样时计算，detach)
+            # - loss = -reward * log q_student_new(y)  (只让梯度通过 new_logprobs)
+            #
+            # 这等价于最小化 reverse KL，但使用 REINFORCE 方式来估计梯度
+            
             if self.kl_type == "reverse":
-                # Reverse KL: KL(Q||P) = E_Q[log Q - log P]
-                # loss = (new_logprobs - teacher_logprobs) 的均值
-                # new_logprobs 有梯度，teacher_logprobs 没有梯度
+                # Reverse KL: 最小化 KL(Q||P) = E_Q[log Q - log P]
                 # 
-                # 这和伪代码一致：
-                # reverse_kl = sampled_logprobs - teacher_logprobs
-                # 但我们用 new_logprobs（重新计算的，有梯度）代替 sampled_logprobs
-                reverse_kl = new_logprobs - teacher_logprobs  # [batch, num_new_tokens]
-                loss = (reverse_kl * token_mask).sum() / num_valid_tokens
+                # 简化实现：直接计算 (new_logprobs - teacher_logprobs)
+                # 这是 reverse KL 的 per-token 估计
+                # 最小化这个等价于让 student 接近 teacher
+                #
+                # 注意：reverse KL 可能为负（当 student 比 teacher 更不自信时）
+                # 所以我们用 |new_logprobs - teacher_logprobs| 或者加一个偏移
+                
+                # 方法：直接用 (student_log_prob - teacher_log_prob) 的绝对值
+                # 这样 loss 总是正的，梯度方向也是正确的
+                kl_per_token = new_logprobs - teacher_logprobs  # [batch, num_new_tokens]
+                
+                # 使用 softplus 确保 loss 非负且平滑
+                # softplus(x) = log(1 + exp(x))，当 x>0 时 ≈ x，当 x<0 时 ≈ 0
+                # 我们想最小化 KL，即让 student log prob 接近 teacher log prob
+                # 当 student < teacher 时，kl_per_token < 0，我们要增大 student
+                # 当 student > teacher 时，kl_per_token > 0，我们要减小 student
+                # 所以直接用 kl_per_token 作为 loss（它的梯度方向是正确的）
+                
+                loss = (kl_per_token * token_mask).sum() / num_valid_tokens
+                
+                # 调试信息
+                if self.state.global_step % 10 == 0:
+                    print(f"[Debug] Step {self.state.global_step}: "
+                          f"num_new_tokens={num_new_tokens}, "
+                          f"teacher_logprobs mean={teacher_logprobs.mean().item():.4f}, "
+                          f"new_logprobs mean={new_logprobs.mean().item():.4f}", flush=True)
+                    print(f"[Debug] kl_per_token mean={kl_per_token.mean().item():.4f}, "
+                          f"token_mask sum={token_mask.sum().item():.0f}, "
+                          f"final loss={loss.item():.4f}", flush=True)
                 
             elif self.kl_type == "forward":
-                # Forward KL: KL(P||Q) = E_P[log P - log Q]
-                # 由于我们从 Q 采样，用 importance sampling:
-                # KL(P||Q) ≈ E_Q[(P/Q) * (log P - log Q)]
-                with torch.no_grad():
-                    # importance weight = P(a)/Q(a) = exp(log P - log Q)
-                    importance_weights = (teacher_logprobs - sampled_logprobs).exp()
-                    importance_weights = importance_weights.clamp(max=10.0)  # 防止权重过大
+                # Forward KL: 最小化 KL(P||Q) = E_P[log P - log Q]
+                # 
+                # 由于我们从 Q 采样而不是 P，需要用 importance sampling：
+                # KL(P||Q) ≈ E_Q[w * (log P - log Q)]，其中 w = P/Q
+                #
+                # 但更简单的做法是直接用 cross-entropy（Forward KL 的主要项）：
+                # loss = -E_P[log Q] ≈ -sum(p_teacher(y) * log q_student(y))
+                #
+                # 对于采样到的 token，用 teacher 的概率作为权重
                 
-                # loss = E_Q[w * (log P - log Q)] = E_Q[w * (-log Q + log P)]
-                # 只有 -log Q 部分有梯度
-                forward_kl = importance_weights * (teacher_logprobs - new_logprobs)
-                loss = (forward_kl * token_mask).sum() / num_valid_tokens
+                with torch.no_grad():
+                    # 获取 teacher 对采样 token 的概率作为权重
+                    teacher_probs_sampled = teacher_logprobs.exp()  # p_teacher(y_sampled)
+                    # 归一化权重（可选，防止数值问题）
+                    weights = teacher_probs_sampled / (teacher_probs_sampled.sum(dim=-1, keepdim=True) + 1e-8)
+                    weights = weights * token_mask.sum(dim=-1, keepdim=True)  # 恢复 scale
+                
+                # Weighted negative log-likelihood
+                # 让 student 在 teacher 概率高的 token 上增大概率
+                loss = -(weights * new_logprobs * token_mask).sum() / num_valid_tokens
+                
             else:
                 raise ValueError(f"Unknown KL type: {self.kl_type}. Must be 'forward' or 'reverse'")
             

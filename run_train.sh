@@ -1,4 +1,9 @@
 #!/bin/bash
+set -e
+
+# 激活 conda 环境
+eval "$(~/miniconda3/bin/conda shell.bash hook)"
+conda activate adaspec
 
 # Check if the required arguments are provided
 if [ "$#" -ne 2 ]; then
@@ -30,7 +35,19 @@ fi
 
 nvidia-smi
 
-accelerate launch --config_file accelerate_configs/zero1.yaml train.py \
+# 清理可能残留的分布式进程
+pkill -9 -f "train.py" 2>/dev/null || true
+sleep 3
+
+# 设置 NCCL 和 CUDA 环境变量以避免设备冲突
+export NCCL_DEBUG=INFO
+export NCCL_P2P_DISABLE=1
+export NCCL_IB_DISABLE=1
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export TORCH_NCCL_BLOCKING_WAIT=1
+
+# 注意: GPU 3 当前被锁定，只使用 GPU 0,1,2
+CUDA_VISIBLE_DEVICES=0,1,2 accelerate launch --config_file accelerate_configs/zero1_3gpu.yaml train.py \
     --draft_model_name_or_path $model \
     --target_model_name_or_path "/mnt/blob/onpolicy-spec-ckpt/checkpoints/gsm8k-target-qwen-7b/checkpoint-5610" \
     \
